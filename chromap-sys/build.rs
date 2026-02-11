@@ -28,6 +28,7 @@ fn main() {
         .flag("-O3")
         .flag("-fopenmp")  // Enable OpenMP for parallel processing
         .flag("-fPIC")
+        .flag("-fpermissive")  // Allow template-dependent name resolution
         .include("ext/chromap/src");
 
     // List of chromap source files

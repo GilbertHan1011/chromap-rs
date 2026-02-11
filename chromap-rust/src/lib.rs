@@ -1,6 +1,11 @@
-use chromap_sys::{ChromapMapper, RustMapping};
-use std::ffi::{CString, NulError};
+use chromap_sys::{ChromapMapper, RustPairsMapping};
+use std::ffi::{CStr, CString, NulError};
 use std::path::Path;
+use noodles::sam;
+use noodles::sam::alignment::RecordBuf;
+use noodles::sam::header::record::value::Map;
+use noodles::sam::header::record::value::map::ReferenceSequence;
+use noodles::fastq;
 
 /// Error types for chromap operations
 #[derive(Debug)]
@@ -34,17 +39,19 @@ impl std::fmt::Display for ChromapError {
 
 impl std::error::Error for ChromapError {}
 
-/// A mapping result for a single read
+/// A Hi-C pairs mapping result containing both ends of the pair
 #[derive(Debug, Clone)]
 pub struct MappingResult {
     pub read_id: u32,
-    pub ref_id: u32,
-    pub ref_pos: u32,
+    pub rid1: i32,      // Reference ID for end 1 (-1 = unmapped)
+    pub rid2: i32,      // Reference ID for end 2 (-1 = unmapped)
+    pub pos1: u32,      // Position for end 1
+    pub pos2: u32,      // Position for end 2
+    pub strand1: Strand, // Strand for end 1
+    pub strand2: Strand, // Strand for end 2
     pub mapq: u8,
-    pub strand: Strand,
-    pub num_dups: u16,
     pub is_unique: bool,
-    pub is_primary: bool,
+    pub num_dups: u8,
 }
 
 /// Strand orientation
@@ -54,21 +61,27 @@ pub enum Strand {
     Reverse,
 }
 
-impl From<RustMapping> for MappingResult {
-    fn from(mapping: RustMapping) -> Self {
+impl From<RustPairsMapping> for MappingResult {
+    fn from(mapping: RustPairsMapping) -> Self {
         MappingResult {
             read_id: mapping.read_id,
-            ref_id: mapping.ref_id,
-            ref_pos: mapping.ref_pos,
-            mapq: mapping.mapq,
-            strand: if mapping.strand == 0 {
+            rid1: mapping.rid1,
+            rid2: mapping.rid2,
+            pos1: mapping.pos1,
+            pos2: mapping.pos2,
+            strand1: if mapping.strand1 == 1 {
                 Strand::Forward
             } else {
                 Strand::Reverse
             },
-            num_dups: mapping.num_dups,
+            strand2: if mapping.strand2 == 1 {
+                Strand::Forward
+            } else {
+                Strand::Reverse
+            },
+            mapq: mapping.mapq,
             is_unique: mapping.is_unique != 0,
-            is_primary: mapping.is_primary != 0,
+            num_dups: mapping.num_dups,
         }
     }
 }
@@ -76,6 +89,9 @@ impl From<RustMapping> for MappingResult {
 /// High-level chromap aligner interface
 pub struct ChromapAligner {
     inner: *mut ChromapMapper,
+    header: sam::Header,
+    contig_names: Vec<String>,
+    contig_lengths: Vec<usize>,
 }
 
 impl ChromapAligner {
@@ -124,7 +140,58 @@ impl ChromapAligner {
                 return Err(ChromapError::InitializationError);
             }
 
-            Ok(ChromapAligner { inner })
+            // Get reference sequence information
+            let num_refs = chromap_sys::mapper_get_num_references(inner);
+            if num_refs < 0 {
+                chromap_sys::mapper_free(inner);
+                return Err(ChromapError::InitializationError);
+            }
+
+            let mut contig_names = Vec::new();
+            let mut contig_lengths = Vec::new();
+
+            for i in 0..num_refs {
+                let name_ptr = chromap_sys::mapper_get_reference_name(inner, i);
+                if name_ptr.is_null() {
+                    chromap_sys::mapper_free(inner);
+                    return Err(ChromapError::InitializationError);
+                }
+                let name = CStr::from_ptr(name_ptr)
+                    .to_str()
+                    .map_err(|_| ChromapError::InvalidInput("Invalid reference name".to_string()))?
+                    .to_string();
+
+                let length = chromap_sys::mapper_get_reference_length(inner, i);
+                if length < 0 {
+                    chromap_sys::mapper_free(inner);
+                    return Err(ChromapError::InitializationError);
+                }
+
+                contig_names.push(name);
+                contig_lengths.push(length as usize);
+            }
+
+            // Create SAM header
+            let ref_seqs = contig_names
+                .iter()
+                .zip(contig_lengths.iter())
+                .map(|(name, len)| {
+                    (
+                        bstr::BString::from(name.as_str()),
+                        Map::<ReferenceSequence>::new(std::num::NonZeroUsize::try_from(*len).unwrap()),
+                    )
+                })
+                .collect();
+            let header = sam::Header::builder()
+                .set_reference_sequences(ref_seqs)
+                .build();
+
+            Ok(ChromapAligner {
+                inner,
+                header,
+                contig_names,
+                contig_lengths,
+            })
         }
     }
 
@@ -196,22 +263,34 @@ impl ChromapAligner {
         let ptrs_q1: Vec<*const i8> = c_r1_quals.iter().map(|c| c.as_ptr()).collect();
         let ptrs_q2: Vec<*const i8> = c_r2_quals.iter().map(|c| c.as_ptr()).collect();
 
-        // Allocate output buffer
+        // Allocate output buffer for Hi-C pairs mappings
         let mut results = vec![
-            RustMapping {
+            RustPairsMapping {
                 read_id: 0,
-                ref_id: 0,
-                ref_pos: 0,
+                rid1: -1,
+                rid2: -1,
+                pos1: 0,
+                pos2: 0,
+                strand1: 0,
+                strand2: 0,
                 mapq: 0,
-                strand: 0,
-                num_dups: 0,
                 is_unique: 0,
-                is_primary: 0,
+                num_dups: 0,
             };
             n
         ];
 
         unsafe {
+            eprintln!("[ChromapAligner] Calling mapper_map_batch with {} pairs", n);
+            if !r1_seqs.is_empty() {
+                let sample_seq: String = r1_seqs[0].chars().take(50).collect();
+                let sample_qual: String = r1_quals[0].chars().take(50).collect();
+                eprintln!("[ChromapAligner] Sample R1 seq (first 50bp): {}", sample_seq);
+                eprintln!("[ChromapAligner] Sample R1 qual (first 50bp): {}", sample_qual);
+            } else {
+                eprintln!("[ChromapAligner] No sequences to map (empty batch)");
+            }
+            
             let ret = chromap_sys::mapper_map_batch(
                 self.inner,
                 ptrs_r1.as_ptr(),
@@ -223,14 +302,55 @@ impl ChromapAligner {
                 n as i32,
             );
 
+            eprintln!("[ChromapAligner] mapper_map_batch returned: {}", ret);
+
             if ret < 0 {
+                eprintln!("[ChromapAligner] ERROR: mapper_map_batch failed with code {}", ret);
                 return Err(ChromapError::MappingError);
             }
 
             // Convert to high-level results
-            Ok(results.into_iter().map(|r| r.into()).collect())
+            Ok(results
+                .into_iter()
+                .map(MappingResult::from)
+                .collect::<Vec<MappingResult>>())
         }
     }
+
+    /// Get the SAM header
+    pub fn get_sam_header(&self) -> sam::Header {
+        self.header.clone()
+    }
+
+    /* Commented out - not used by hic-tailor integration
+    /// Align reads and return SAM records
+    ///
+    /// # Arguments
+    /// * `records` - Vector of FASTQ record pairs (R1, R2)
+    ///
+    /// # Returns
+    /// Vector of SAM RecordBuf objects
+    pub fn align_reads(
+        &self,
+        records: &[(fastq::Record, fastq::Record)],
+    ) -> Result<Vec<RecordBuf>, ChromapError> {
+        // Implementation commented out - use map_batch instead
+        unimplemented!("Use map_batch for hic-tailor integration")
+    }
+
+    /// Convert a MappingResult to a SAM RecordBuf
+    fn mapping_to_sam_record(
+        &self,
+        mapping: &MappingResult,
+        name: &[u8],
+        sequence: &[u8],
+        quality: &[u8],
+        is_r1: bool,
+    ) -> Result<RecordBuf, ChromapError> {
+        // Implementation commented out - not needed for hic-tailor
+        unimplemented!("Not used in hic-tailor integration")
+    }
+    */
 }
 
 impl Drop for ChromapAligner {
@@ -251,19 +371,22 @@ mod tests {
 
     #[test]
     fn test_strand_conversion() {
-        let mapping = RustMapping {
+        let mapping = RustPairsMapping {
             read_id: 0,
-            ref_id: 1,
-            ref_pos: 100,
+            rid1: 1,
+            rid2: 2,
+            pos1: 100,
+            pos2: 200,
+            strand1: 1,
+            strand2: 0,
             mapq: 60,
-            strand: 0,
-            num_dups: 0,
             is_unique: 1,
-            is_primary: 1,
+            num_dups: 0,
         };
 
         let result: MappingResult = mapping.into();
-        assert_eq!(result.strand, Strand::Forward);
+        assert_eq!(result.strand1, Strand::Forward);
+        assert_eq!(result.strand2, Strand::Reverse);
     }
 }
 

@@ -9,6 +9,8 @@ repository = "https://github.com/yourusername/chromap-rs"
 
 [dependencies]
 chromap-sys = { version = "0.1.0", path = "../chromap-sys" }
+noodles = { version = "0.101", features = ["core", "fastq", "sam"] }
+bstr = "1.12"
 
 [dev-dependencies]
 

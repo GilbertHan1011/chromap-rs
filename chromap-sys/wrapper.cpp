@@ -1,15 +1,15 @@
 #include "wrapper.h"
-#include "../chromap/src/index.h"
-#include "../chromap/src/sequence_batch.h"
-#include "../chromap/src/minimizer_generator.h"
-#include "../chromap/src/candidate_processor.h"
-#include "../chromap/src/mapping_processor.h"
-#include "../chromap/src/mapping_generator.h"
-#include "../chromap/src/mapping_parameters.h"
-#include "../chromap/src/sam_mapping.h"
-#include "../chromap/src/draft_mapping_generator.h"
-#include "../chromap/src/paired_end_mapping_metadata.h"
-#include "../chromap/src/mapping_metadata.h"
+#include "ext/chromap/src/index.h"
+#include "ext/chromap/src/sequence_batch.h"
+#include "ext/chromap/src/minimizer_generator.h"
+#include "ext/chromap/src/candidate_processor.h"
+#include "ext/chromap/src/mapping_processor.h"
+#include "ext/chromap/src/mapping_generator.h"
+#include "ext/chromap/src/mapping_parameters.h"
+#include "ext/chromap/src/pairs_mapping.h"
+#include "ext/chromap/src/draft_mapping_generator.h"
+#include "ext/chromap/src/paired_end_mapping_metadata.h"
+#include "ext/chromap/src/mapping_metadata.h"
 #include <cstring>
 #include <vector>
 #include <memory>
@@ -72,7 +72,7 @@ struct ChromapMapper {
     MinimizerGenerator* minimizer_generator;
     CandidateProcessor* candidate_processor;
     DraftMappingGenerator* draft_mapping_generator;
-    MappingGenerator<SAMMapping>* mapping_generator;
+    MappingGenerator<PairsMapping>* mapping_generator;
 
     ChromapMapper() : index(nullptr), reference(nullptr),
                       minimizer_generator(nullptr), candidate_processor(nullptr),
@@ -100,15 +100,31 @@ ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_
         mapper->params.num_threads = num_threads;
         mapper->num_threads = num_threads;
 
-        // Set default mapping parameters
-        mapper->params.error_threshold = 8;
+        // Apply Hi-C preset parameters (equivalent to chromap --preset hic)
+        mapper->params.error_threshold = 4;              // Stricter than default (was 8)
+        mapper->params.mapq_threshold = 1;               // Very permissive (default is 30)
+        mapper->params.split_alignment = true;            // Allow chimeric alignments at ligation junctions
+        mapper->params.low_memory_mode = true;           // Hi-C preset uses low memory mode
+        mapper->params.mapping_output_format = MAPPINGFORMAT_PAIRS;  // Hi-C pairs format
+        
+        // Keep standard minimizer/seed settings
         mapper->params.min_num_seeds_required_for_mapping = 2;
         mapper->params.max_seed_frequencies.resize(2);
         mapper->params.max_seed_frequencies[0] = 500;
         mapper->params.max_seed_frequencies[1] = 1000;
         mapper->params.max_num_best_mappings = 1;
-        mapper->params.max_insert_size = 1000;
-        mapper->params.split_alignment = false;
+        mapper->params.max_insert_size = 1000;           // Not strictly enforced in Hi-C mode
+        mapper->params.is_bulk_data = true;
+        
+        // Initialize string fields that might be accessed during mapping
+        mapper->params.read_format = "";
+        mapper->params.mapping_output_file_path = "";
+        mapper->params.barcode_whitelist_file_path = "";
+        mapper->params.custom_rid_order_file_path = "";
+        mapper->params.pairs_flipping_custom_rid_order_file_path = "";
+        mapper->params.barcode_translate_table_file_path = "";
+        mapper->params.summary_metadata_file_path = "";
+        mapper->params.matrix_output_prefix = "";
 
         // Load reference
         mapper->reference = new SequenceBatch();
@@ -123,17 +139,33 @@ ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_
         mapper->window_size = mapper->index->GetWindowSize();
 
         // Initialize processors
+        std::cerr << "[mapper_new] Initializing MinimizerGenerator..." << std::endl;
         mapper->minimizer_generator = new MinimizerGenerator(mapper->kmer_size, mapper->window_size);
+        std::cerr << "[mapper_new] Initializing CandidateProcessor..." << std::endl;
         mapper->candidate_processor = new CandidateProcessor(
             mapper->params.min_num_seeds_required_for_mapping,
             mapper->params.max_seed_frequencies);
+        std::cerr << "[mapper_new] Initializing DraftMappingGenerator..." << std::endl;
         mapper->draft_mapping_generator = new DraftMappingGenerator(mapper->params);
 
-        std::vector<int> empty_ranks;  // Empty custom rid ranks
-        mapper->mapping_generator = new MappingGenerator<SAMMapping>(mapper->params, empty_ranks);
+        std::cerr << "[mapper_new] Initializing MappingGenerator (Hi-C PairsMapping mode)..." << std::endl;
+        // For Hi-C pairs format, we need to provide chromosome rank ordering
+        // Empty rank vector means use natural ordering (chr1, chr2, ...)
+        std::vector<int> chr_ranks(mapper->num_reference_sequences);
+        for (uint32_t i = 0; i < mapper->num_reference_sequences; ++i) {
+            chr_ranks[i] = i;  // Natural ordering by index
+        }
+        mapper->mapping_generator = new MappingGenerator<PairsMapping>(mapper->params, chr_ranks);
+        std::cerr << "[mapper_new] All processors initialized successfully" << std::endl;
 
+        std::cerr << "[mapper_new] Mapper initialization completed successfully" << std::endl;
         return mapper;
+    } catch (const std::exception& e) {
+        std::cerr << "[mapper_new] ERROR: Exception during initialization: " << e.what() << std::endl;
+        delete mapper;
+        return nullptr;
     } catch (...) {
+        std::cerr << "[mapper_new] ERROR: Unknown exception during initialization" << std::endl;
         delete mapper;
         return nullptr;
     }
@@ -149,19 +181,25 @@ int mapper_map_batch(ChromapMapper* mapper,
                      const char** seqs1, const char** seqs2,
                      const char** quals1, const char** quals2,
                      int n_reads,
-                     RustMapping* out_buffer,
+                     RustPairsMapping* out_buffer,
                      int buffer_size) {
     if (!mapper || !seqs1 || !seqs2 || n_reads <= 0 || !out_buffer || buffer_size < n_reads) {
+        std::cerr << "[C++ Wrapper] Invalid input parameters" << std::endl;
         return -1;
     }
 
+    std::cerr << "[C++ Wrapper] Starting mapper_map_batch with " << n_reads << " reads" << std::endl;
+
     try {
         // Create SequenceBatch objects for the reads
+        std::cerr << "[C++ Wrapper] Creating SequenceBatch objects..." << std::endl;
         SequenceEffectiveRange full_range;  // Full sequence range
         SequenceBatch read_batch1(n_reads, full_range);
         SequenceBatch read_batch2(n_reads, full_range);
+        std::cerr << "[C++ Wrapper] SequenceBatch objects created successfully" << std::endl;
 
         // Populate the sequence batches
+        std::cerr << "[C++ Wrapper] Populating sequence batches..." << std::endl;
         auto& batch1_seqs = read_batch1.GetSequenceBatch();
         auto& batch2_seqs = read_batch2.GetSequenceBatch();
 
@@ -171,43 +209,62 @@ int mapper_map_batch(ChromapMapper* mapper,
 
             populate_kseq(batch1_seqs[i], i * 2, read_name, seqs1[i], quals1[i]);
             populate_kseq(batch2_seqs[i], i * 2 + 1, read_name, seqs2[i], quals2[i]);
+            
+            if (i == 0) {
+                std::cerr << "[C++ Wrapper] First pair - R1 len: " << strlen(seqs1[i]) 
+                          << ", R2 len: " << strlen(seqs2[i]) << std::endl;
+            }
         }
+        std::cerr << "[C++ Wrapper] Populated " << n_reads << " pairs successfully" << std::endl;
 
         // Prepare negative sequences (reverse complement)
+        std::cerr << "[C++ Wrapper] Preparing negative sequences..." << std::endl;
         for (int i = 0; i < n_reads; ++i) {
             read_batch1.PrepareNegativeSequenceAt(i);
             read_batch2.PrepareNegativeSequenceAt(i);
         }
+        std::cerr << "[C++ Wrapper] Negative sequences prepared successfully" << std::endl;
 
         // Process each read pair
-        std::vector<SAMMapping> all_mappings;
+        std::cerr << "[C++ Wrapper] Starting main mapping loop for " << n_reads << " pairs..." << std::endl;
         std::mt19937 generator(11);
         std::vector<int> best_mapping_indices(mapper->params.max_num_best_mappings);
 
         for (int pair_idx = 0; pair_idx < n_reads; ++pair_idx) {
+            if (pair_idx == 0 || pair_idx % 5000 == 0) {
+                std::cerr << "[C++ Wrapper] Processing pair " << pair_idx << "/" << n_reads << std::endl;
+            }
+            
             // Skip if reads are too short
             if (read_batch1.GetSequenceLengthAt(pair_idx) < 20 ||
                 read_batch2.GetSequenceLengthAt(pair_idx) < 20) {
                 out_buffer[pair_idx].read_id = pair_idx;
-                out_buffer[pair_idx].ref_id = 0xFFFFFFFF;  // Unmapped
-                out_buffer[pair_idx].ref_pos = 0;
+                out_buffer[pair_idx].rid1 = -1;  // Unmapped
+                out_buffer[pair_idx].rid2 = -1;  // Unmapped
+                out_buffer[pair_idx].pos1 = 0;
+                out_buffer[pair_idx].pos2 = 0;
+                out_buffer[pair_idx].strand1 = 0;
+                out_buffer[pair_idx].strand2 = 0;
                 out_buffer[pair_idx].mapq = 0;
-                out_buffer[pair_idx].strand = 0;
-                out_buffer[pair_idx].num_dups = 0;
                 out_buffer[pair_idx].is_unique = 0;
-                out_buffer[pair_idx].is_primary = 1;
+                out_buffer[pair_idx].num_dups = 0;
                 continue;
             }
 
+          try {
             // Create metadata for this read pair
+            if (pair_idx == 0) std::cerr << "[C++ Wrapper] Creating PairedEndMappingMetadata..." << std::endl;
             PairedEndMappingMetadata paired_metadata;
+            if (pair_idx == 0) std::cerr << "[C++ Wrapper] Calling PreparedForMappingNextReadPair..." << std::endl;
             paired_metadata.PreparedForMappingNextReadPair(
                 mapper->params.max_seed_frequencies[0]);
 
             // Generate minimizers for both reads
+            if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating minimizers for R1..." << std::endl;
             mapper->minimizer_generator->GenerateMinimizers(
                 read_batch1, pair_idx,
                 paired_metadata.mapping_metadata1_.minimizers_);
+            if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating minimizers for R2..." << std::endl;
             mapper->minimizer_generator->GenerateMinimizers(
                 read_batch2, pair_idx,
                 paired_metadata.mapping_metadata2_.minimizers_);
@@ -215,21 +272,25 @@ int mapper_map_batch(ChromapMapper* mapper,
             // Check if both ends have minimizers
             if (!paired_metadata.BothEndsHaveMinimizers()) {
                 out_buffer[pair_idx].read_id = pair_idx;
-                out_buffer[pair_idx].ref_id = 0xFFFFFFFF;  // Unmapped
-                out_buffer[pair_idx].ref_pos = 0;
+                out_buffer[pair_idx].rid1 = -1;  // Unmapped
+                out_buffer[pair_idx].rid2 = -1;  // Unmapped
+                out_buffer[pair_idx].pos1 = 0;
+                out_buffer[pair_idx].pos2 = 0;
+                out_buffer[pair_idx].strand1 = 0;
+                out_buffer[pair_idx].strand2 = 0;
                 out_buffer[pair_idx].mapq = 0;
-                out_buffer[pair_idx].strand = 0;
-                out_buffer[pair_idx].num_dups = 0;
                 out_buffer[pair_idx].is_unique = 0;
-                out_buffer[pair_idx].is_primary = 1;
+                out_buffer[pair_idx].num_dups = 0;
                 continue;
             }
 
             // Generate candidates for both reads
+            if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating candidates for R1..." << std::endl;
             mapper->candidate_processor->GenerateCandidates(
                 mapper->params.error_threshold,
                 *(mapper->index),
                 paired_metadata.mapping_metadata1_);
+            if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating candidates for R2..." << std::endl;
             mapper->candidate_processor->GenerateCandidates(
                 mapper->params.error_threshold,
                 *(mapper->index),
@@ -242,6 +303,7 @@ int mapper_map_batch(ChromapMapper* mapper,
             if (num_candidates1 > 0 && num_candidates2 > 0) {
                 // Supplement candidates with mate information
                 if (!mapper->params.split_alignment) {
+                    if (pair_idx == 0) std::cerr << "[C++ Wrapper] Supplementing candidates..." << std::endl;
                     mapper->candidate_processor->SupplementCandidates(
                         mapper->params.error_threshold,
                         2 * mapper->params.max_insert_size,
@@ -249,20 +311,28 @@ int mapper_map_batch(ChromapMapper* mapper,
                         paired_metadata);
 
                     // Move candidates to buffer and reduce based on insert size
+                    if (pair_idx == 0) std::cerr << "[C++ Wrapper] Moving candidates to buffer..." << std::endl;
                     paired_metadata.MoveCandidiatesToBuffer();
+                    if (pair_idx == 0) std::cerr << "[C++ Wrapper] Reducing candidates..." << std::endl;
                     mapper->candidate_processor->ReduceCandidatesForPairedEndRead(
                         mapper->params.max_insert_size,
                         paired_metadata);
 
+                    if (pair_idx == 0) std::cerr << "[C++ Wrapper] Getting candidate counts..." << std::endl;
                     num_candidates1 = paired_metadata.mapping_metadata1_.GetNumCandidates();
+                    if (pair_idx == 0) std::cerr << "[C++ Wrapper] R1 candidates: " << num_candidates1 << std::endl;
                     num_candidates2 = paired_metadata.mapping_metadata2_.GetNumCandidates();
+                    if (pair_idx == 0) std::cerr << "[C++ Wrapper] R2 candidates: " << num_candidates2 << std::endl;
                 }
 
                 // Generate draft mappings if we still have candidates
+                if (pair_idx == 0) std::cerr << "[C++ Wrapper] Checking if we have candidates for draft mapping..." << std::endl;
                 if (num_candidates1 > 0 && num_candidates2 > 0) {
+                    if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating draft mappings for R1..." << std::endl;
                     mapper->draft_mapping_generator->GenerateDraftMappings(
                         read_batch1, pair_idx, *(mapper->reference),
                         paired_metadata.mapping_metadata1_);
+                    if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating draft mappings for R2..." << std::endl;
                     mapper->draft_mapping_generator->GenerateDraftMappings(
                         read_batch2, pair_idx, *(mapper->reference),
                         paired_metadata.mapping_metadata2_);
@@ -274,36 +344,43 @@ int mapper_map_batch(ChromapMapper* mapper,
                     if (num_draft1 > 0 && num_draft2 > 0) {
                         // Sort mappings by position for paired-end processing
                         if (!mapper->params.split_alignment) {
+                            if (pair_idx == 0) std::cerr << "[C++ Wrapper] Sorting mappings by positions..." << std::endl;
                             paired_metadata.SortMappingsByPositions();
                         }
 
-                        // Create temporary storage for mappings
-                        std::vector<std::vector<SAMMapping>> mappings_on_refs(
+                        // Create temporary storage for Hi-C pairs mappings
+                        if (pair_idx == 0) std::cerr << "[C++ Wrapper] Creating storage for " << mapper->num_reference_sequences << " references..." << std::endl;
+                        std::vector<std::vector<PairsMapping>> mappings_on_refs(
                             mapper->num_reference_sequences);
 
                         // Dummy barcode batch (not used for bulk data)
+                        if (pair_idx == 0) std::cerr << "[C++ Wrapper] Creating dummy barcode batch..." << std::endl;
                         SequenceBatch dummy_barcode(0, full_range);
 
-                        // Generate best mappings
+                        // Generate best mappings for Hi-C pairs
+                        if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating best Hi-C pairs mappings..." << std::endl;
                         mapper->mapping_generator->GenerateBestMappingsForPairedEndRead(
                             pair_idx, read_batch1, read_batch2, dummy_barcode,
                             *(mapper->reference), best_mapping_indices, generator,
                             -1,  // force_mapq
                             paired_metadata, mappings_on_refs);
 
-                        // Extract the first mapping if available
+                        // Extract the first pairs mapping if available
+                        // Note: PairsMapping contains BOTH ends' information in one record
                         bool found_mapping = false;
                         for (const auto& ref_mappings : mappings_on_refs) {
                             if (!ref_mappings.empty()) {
-                                const SAMMapping& mapping = ref_mappings[0];
+                                const PairsMapping& mapping = ref_mappings[0];
                                 out_buffer[pair_idx].read_id = pair_idx;
-                                out_buffer[pair_idx].ref_id = mapping.rid_;
-                                out_buffer[pair_idx].ref_pos = mapping.pos_;
+                                out_buffer[pair_idx].rid1 = mapping.rid1_;
+                                out_buffer[pair_idx].rid2 = mapping.rid2_;
+                                out_buffer[pair_idx].pos1 = mapping.pos1_;
+                                out_buffer[pair_idx].pos2 = mapping.pos2_;
+                                out_buffer[pair_idx].strand1 = mapping.strand1_;
+                                out_buffer[pair_idx].strand2 = mapping.strand2_;
                                 out_buffer[pair_idx].mapq = mapping.mapq_;
-                                out_buffer[pair_idx].strand = (mapping.is_rev_ ? 1 : 0);
-                                out_buffer[pair_idx].num_dups = 0;
-                                out_buffer[pair_idx].is_unique = (paired_metadata.GetNumBestMappings() == 1 ? 1 : 0);
-                                out_buffer[pair_idx].is_primary = 1;
+                                out_buffer[pair_idx].is_unique = mapping.is_unique_;
+                                out_buffer[pair_idx].num_dups = mapping.num_dups_;
                                 found_mapping = true;
                                 break;
                             }
@@ -312,53 +389,100 @@ int mapper_map_batch(ChromapMapper* mapper,
                         if (!found_mapping) {
                             // No mapping found
                             out_buffer[pair_idx].read_id = pair_idx;
-                            out_buffer[pair_idx].ref_id = 0xFFFFFFFF;
-                            out_buffer[pair_idx].ref_pos = 0;
+                            out_buffer[pair_idx].rid1 = -1;
+                            out_buffer[pair_idx].rid2 = -1;
+                            out_buffer[pair_idx].pos1 = 0;
+                            out_buffer[pair_idx].pos2 = 0;
+                            out_buffer[pair_idx].strand1 = 0;
+                            out_buffer[pair_idx].strand2 = 0;
                             out_buffer[pair_idx].mapq = 0;
-                            out_buffer[pair_idx].strand = 0;
-                            out_buffer[pair_idx].num_dups = 0;
                             out_buffer[pair_idx].is_unique = 0;
-                            out_buffer[pair_idx].is_primary = 1;
+                            out_buffer[pair_idx].num_dups = 0;
                         }
                     } else {
                         // No draft mappings
                         out_buffer[pair_idx].read_id = pair_idx;
-                        out_buffer[pair_idx].ref_id = 0xFFFFFFFF;
-                        out_buffer[pair_idx].ref_pos = 0;
+                        out_buffer[pair_idx].rid1 = -1;
+                        out_buffer[pair_idx].rid2 = -1;
+                        out_buffer[pair_idx].pos1 = 0;
+                        out_buffer[pair_idx].pos2 = 0;
+                        out_buffer[pair_idx].strand1 = 0;
+                        out_buffer[pair_idx].strand2 = 0;
                         out_buffer[pair_idx].mapq = 0;
-                        out_buffer[pair_idx].strand = 0;
-                        out_buffer[pair_idx].num_dups = 0;
                         out_buffer[pair_idx].is_unique = 0;
-                        out_buffer[pair_idx].is_primary = 1;
+                        out_buffer[pair_idx].num_dups = 0;
                     }
                 } else {
                     // No candidates after filtering
                     out_buffer[pair_idx].read_id = pair_idx;
-                    out_buffer[pair_idx].ref_id = 0xFFFFFFFF;
-                    out_buffer[pair_idx].ref_pos = 0;
+                    out_buffer[pair_idx].rid1 = -1;
+                    out_buffer[pair_idx].rid2 = -1;
+                    out_buffer[pair_idx].pos1 = 0;
+                    out_buffer[pair_idx].pos2 = 0;
+                    out_buffer[pair_idx].strand1 = 0;
+                    out_buffer[pair_idx].strand2 = 0;
                     out_buffer[pair_idx].mapq = 0;
-                    out_buffer[pair_idx].strand = 0;
-                    out_buffer[pair_idx].num_dups = 0;
                     out_buffer[pair_idx].is_unique = 0;
-                    out_buffer[pair_idx].is_primary = 1;
+                    out_buffer[pair_idx].num_dups = 0;
                 }
             } else {
                 // No candidates for one or both reads
                 out_buffer[pair_idx].read_id = pair_idx;
-                out_buffer[pair_idx].ref_id = 0xFFFFFFFF;
-                out_buffer[pair_idx].ref_pos = 0;
+                out_buffer[pair_idx].rid1 = -1;
+                out_buffer[pair_idx].rid2 = -1;
+                out_buffer[pair_idx].pos1 = 0;
+                out_buffer[pair_idx].pos2 = 0;
+                out_buffer[pair_idx].strand1 = 0;
+                out_buffer[pair_idx].strand2 = 0;
                 out_buffer[pair_idx].mapq = 0;
-                out_buffer[pair_idx].strand = 0;
-                out_buffer[pair_idx].num_dups = 0;
                 out_buffer[pair_idx].is_unique = 0;
-                out_buffer[pair_idx].is_primary = 1;
+                out_buffer[pair_idx].num_dups = 0;
             }
+          } catch (const std::exception& e) {
+              std::cerr << "[C++ Wrapper] ERROR at pair_idx=" << pair_idx << ": " << e.what() << std::endl;
+              // Log read lengths for the failing pair
+              std::cerr << "[C++ Wrapper] Failing pair R1 len: " << read_batch1.GetSequenceLengthAt(pair_idx)
+                        << ", R2 len: " << read_batch2.GetSequenceLengthAt(pair_idx) << std::endl;
+              return -1;
+          } catch (...) {
+              std::cerr << "[C++ Wrapper] ERROR at pair_idx=" << pair_idx << ": unknown exception" << std::endl;
+              return -1;
+          }
         }
 
+        std::cerr << "[C++ Wrapper] Mapping completed successfully, returning " << n_reads << std::endl;
         return n_reads;
+    } catch (const std::exception& e) {
+        std::cerr << "[C++ Wrapper] ERROR: Exception caught: " << e.what() << std::endl;
+        return -1;
     } catch (...) {
+        std::cerr << "[C++ Wrapper] ERROR: Unknown exception caught" << std::endl;
         return -1;
     }
+}
+
+// Get the number of reference sequences
+int mapper_get_num_references(ChromapMapper* mapper) {
+    if (!mapper || !mapper->reference) {
+        return -1;
+    }
+    return mapper->num_reference_sequences;
+}
+
+// Get the name of a reference sequence by index
+const char* mapper_get_reference_name(ChromapMapper* mapper, int index) {
+    if (!mapper || !mapper->reference || index < 0 || index >= (int)mapper->num_reference_sequences) {
+        return nullptr;
+    }
+    return mapper->reference->GetSequenceNameAt(index);
+}
+
+// Get the length of a reference sequence by index
+int mapper_get_reference_length(ChromapMapper* mapper, int index) {
+    if (!mapper || !mapper->reference || index < 0 || index >= (int)mapper->num_reference_sequences) {
+        return -1;
+    }
+    return mapper->reference->GetSequenceLengthAt(index);
 }
 
 } // extern "C"
