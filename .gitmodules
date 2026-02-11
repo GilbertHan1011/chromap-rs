@@ -1,0 +1,3 @@
+[submodule "chromap-sys/ext/chromap"]
+	path = chromap-sys/ext/chromap
+	url = https://github.com/haowenz/chromap.git

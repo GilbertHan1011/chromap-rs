@@ -1,0 +1,7 @@
+[workspace]
+members = ["chromap-sys", "chromap-rust"]
+resolver = "2"
+default-members = ["chromap-sys", "chromap-rust"]
+
+[workspace.dependencies]
+chromap-sys = { version = "0.1.0", path = "chromap-sys" }

@@ -1,0 +1,17 @@
+[package]
+name = "chromap-rust"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "High-level Rust bindings for chromap"
+license = "MIT"
+repository = "https://github.com/yourusername/chromap-rs"
+
+[dependencies]
+chromap-sys = { version = "0.1.0", path = "../chromap-sys" }
+
+[dev-dependencies]
+
+[lib]
+name = "chromap_rust"
+path = "src/lib.rs"

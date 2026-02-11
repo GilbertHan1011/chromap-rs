@@ -1,0 +1,16 @@
+[package]
+name = "chromap-sys"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Low-level FFI bindings for chromap"
+license = "MIT"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.0"
+
+[lib]
+name = "chromap_sys"
+path = "src/lib.rs"
