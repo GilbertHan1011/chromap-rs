@@ -58,7 +58,11 @@ static void populate_kseq(SequenceBatch::kseq_t* seq, uint32_t id, const char* n
     seq->f = nullptr;
 }
 
-// Internal structure to hold the mapper state
+// Internal structure to hold the mapper state.
+// NOTE: This struct intentionally keeps only the heavy, read-only objects
+// (index, reference, parameters). All per-batch processors are instantiated
+// on the stack inside mapper_map_batch to ensure thread-safety when the same
+// ChromapMapper is used from multiple Rust threads.
 struct ChromapMapper {
     Index* index;
     SequenceBatch* reference;
@@ -68,29 +72,24 @@ struct ChromapMapper {
     int window_size;
     uint32_t num_reference_sequences;
 
-    // Pre-allocated processors
-    MinimizerGenerator* minimizer_generator;
-    CandidateProcessor* candidate_processor;
-    DraftMappingGenerator* draft_mapping_generator;
-    MappingGenerator<PairsMapping>* mapping_generator;
-
-    ChromapMapper() : index(nullptr), reference(nullptr),
-                      minimizer_generator(nullptr), candidate_processor(nullptr),
-                      draft_mapping_generator(nullptr), mapping_generator(nullptr) {}
+    ChromapMapper()
+        : index(nullptr),
+          reference(nullptr),
+          num_threads(0),
+          kmer_size(0),
+          window_size(0),
+          num_reference_sequences(0) {}
 
     ~ChromapMapper() {
         delete index;
         delete reference;
-        delete minimizer_generator;
-        delete candidate_processor;
-        delete draft_mapping_generator;
-        delete mapping_generator;
     }
 };
 
 extern "C" {
 
-ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_threads) {
+ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_threads,
+                          int min_num_seeds, int min_read_length) {
     ChromapMapper* mapper = new ChromapMapper();
 
     try {
@@ -107,8 +106,9 @@ ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_
         mapper->params.low_memory_mode = true;           // Hi-C preset uses low memory mode
         mapper->params.mapping_output_format = MAPPINGFORMAT_PAIRS;  // Hi-C pairs format
         
-        // Keep standard minimizer/seed settings
-        mapper->params.min_num_seeds_required_for_mapping = 2;
+        // Adjustable seed and read-length settings (-s and --min-read-length)
+        mapper->params.min_num_seeds_required_for_mapping = (min_num_seeds >= 0) ? min_num_seeds : 2;
+        mapper->params.min_read_length = (min_read_length >= 0) ? min_read_length : 30;
         mapper->params.max_seed_frequencies.resize(2);
         mapper->params.max_seed_frequencies[0] = 500;
         mapper->params.max_seed_frequencies[1] = 1000;
@@ -137,26 +137,7 @@ ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_
         mapper->index->Load();
         mapper->kmer_size = mapper->index->GetKmerSize();
         mapper->window_size = mapper->index->GetWindowSize();
-
-        // Initialize processors
-        std::cerr << "[mapper_new] Initializing MinimizerGenerator..." << std::endl;
-        mapper->minimizer_generator = new MinimizerGenerator(mapper->kmer_size, mapper->window_size);
-        std::cerr << "[mapper_new] Initializing CandidateProcessor..." << std::endl;
-        mapper->candidate_processor = new CandidateProcessor(
-            mapper->params.min_num_seeds_required_for_mapping,
-            mapper->params.max_seed_frequencies);
-        std::cerr << "[mapper_new] Initializing DraftMappingGenerator..." << std::endl;
-        mapper->draft_mapping_generator = new DraftMappingGenerator(mapper->params);
-
-        std::cerr << "[mapper_new] Initializing MappingGenerator (Hi-C PairsMapping mode)..." << std::endl;
-        // For Hi-C pairs format, we need to provide chromosome rank ordering
-        // Empty rank vector means use natural ordering (chr1, chr2, ...)
-        std::vector<int> chr_ranks(mapper->num_reference_sequences);
-        for (uint32_t i = 0; i < mapper->num_reference_sequences; ++i) {
-            chr_ranks[i] = i;  // Natural ordering by index
-        }
-        mapper->mapping_generator = new MappingGenerator<PairsMapping>(mapper->params, chr_ranks);
-        std::cerr << "[mapper_new] All processors initialized successfully" << std::endl;
+        std::cerr << "[mapper_new] Reference and index loaded successfully" << std::endl;
 
         std::cerr << "[mapper_new] Mapper initialization completed successfully" << std::endl;
         return mapper;
@@ -225,6 +206,18 @@ int mapper_map_batch(ChromapMapper* mapper,
         }
         std::cerr << "[C++ Wrapper] Negative sequences prepared successfully" << std::endl;
 
+        // Instantiate per-batch processors on the stack to ensure thread-safety.
+        MinimizerGenerator minimizer_generator(mapper->kmer_size, mapper->window_size);
+        CandidateProcessor candidate_processor(
+            mapper->params.min_num_seeds_required_for_mapping,
+            mapper->params.max_seed_frequencies);
+        DraftMappingGenerator draft_mapping_generator(mapper->params);
+        std::vector<int> chr_ranks(mapper->num_reference_sequences);
+        for (uint32_t i = 0; i < mapper->num_reference_sequences; ++i) {
+            chr_ranks[i] = static_cast<int>(i);  // Natural ordering by index
+        }
+        MappingGenerator<PairsMapping> mapping_generator(mapper->params, chr_ranks);
+
         // Process each read pair
         std::cerr << "[C++ Wrapper] Starting main mapping loop for " << n_reads << " pairs..." << std::endl;
         std::mt19937 generator(11);
@@ -236,8 +229,8 @@ int mapper_map_batch(ChromapMapper* mapper,
             }
             
             // Skip if reads are too short
-            if (read_batch1.GetSequenceLengthAt(pair_idx) < 20 ||
-                read_batch2.GetSequenceLengthAt(pair_idx) < 20) {
+            if (read_batch1.GetSequenceLengthAt(pair_idx) < mapper->params.min_read_length ||
+                read_batch2.GetSequenceLengthAt(pair_idx) < mapper->params.min_read_length) {
                 out_buffer[pair_idx].read_id = pair_idx;
                 out_buffer[pair_idx].rid1 = -1;  // Unmapped
                 out_buffer[pair_idx].rid2 = -1;  // Unmapped
@@ -261,11 +254,11 @@ int mapper_map_batch(ChromapMapper* mapper,
 
             // Generate minimizers for both reads
             if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating minimizers for R1..." << std::endl;
-            mapper->minimizer_generator->GenerateMinimizers(
+            minimizer_generator.GenerateMinimizers(
                 read_batch1, pair_idx,
                 paired_metadata.mapping_metadata1_.minimizers_);
             if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating minimizers for R2..." << std::endl;
-            mapper->minimizer_generator->GenerateMinimizers(
+            minimizer_generator.GenerateMinimizers(
                 read_batch2, pair_idx,
                 paired_metadata.mapping_metadata2_.minimizers_);
 
@@ -286,12 +279,12 @@ int mapper_map_batch(ChromapMapper* mapper,
 
             // Generate candidates for both reads
             if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating candidates for R1..." << std::endl;
-            mapper->candidate_processor->GenerateCandidates(
+            candidate_processor.GenerateCandidates(
                 mapper->params.error_threshold,
                 *(mapper->index),
                 paired_metadata.mapping_metadata1_);
             if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating candidates for R2..." << std::endl;
-            mapper->candidate_processor->GenerateCandidates(
+            candidate_processor.GenerateCandidates(
                 mapper->params.error_threshold,
                 *(mapper->index),
                 paired_metadata.mapping_metadata2_);
@@ -304,7 +297,7 @@ int mapper_map_batch(ChromapMapper* mapper,
                 // Supplement candidates with mate information
                 if (!mapper->params.split_alignment) {
                     if (pair_idx == 0) std::cerr << "[C++ Wrapper] Supplementing candidates..." << std::endl;
-                    mapper->candidate_processor->SupplementCandidates(
+                    candidate_processor.SupplementCandidates(
                         mapper->params.error_threshold,
                         2 * mapper->params.max_insert_size,
                         *(mapper->index),
@@ -314,7 +307,7 @@ int mapper_map_batch(ChromapMapper* mapper,
                     if (pair_idx == 0) std::cerr << "[C++ Wrapper] Moving candidates to buffer..." << std::endl;
                     paired_metadata.MoveCandidiatesToBuffer();
                     if (pair_idx == 0) std::cerr << "[C++ Wrapper] Reducing candidates..." << std::endl;
-                    mapper->candidate_processor->ReduceCandidatesForPairedEndRead(
+                    candidate_processor.ReduceCandidatesForPairedEndRead(
                         mapper->params.max_insert_size,
                         paired_metadata);
 
@@ -329,11 +322,11 @@ int mapper_map_batch(ChromapMapper* mapper,
                 if (pair_idx == 0) std::cerr << "[C++ Wrapper] Checking if we have candidates for draft mapping..." << std::endl;
                 if (num_candidates1 > 0 && num_candidates2 > 0) {
                     if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating draft mappings for R1..." << std::endl;
-                    mapper->draft_mapping_generator->GenerateDraftMappings(
+                    draft_mapping_generator.GenerateDraftMappings(
                         read_batch1, pair_idx, *(mapper->reference),
                         paired_metadata.mapping_metadata1_);
                     if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating draft mappings for R2..." << std::endl;
-                    mapper->draft_mapping_generator->GenerateDraftMappings(
+                    draft_mapping_generator.GenerateDraftMappings(
                         read_batch2, pair_idx, *(mapper->reference),
                         paired_metadata.mapping_metadata2_);
 
@@ -353,13 +346,13 @@ int mapper_map_batch(ChromapMapper* mapper,
                         std::vector<std::vector<PairsMapping>> mappings_on_refs(
                             mapper->num_reference_sequences);
 
-                        // Dummy barcode batch (not used for bulk data)
+                        // Dummy barcode batch (not used for bulk data in bulk mode)
                         if (pair_idx == 0) std::cerr << "[C++ Wrapper] Creating dummy barcode batch..." << std::endl;
-                        SequenceBatch dummy_barcode(0, full_range);
+                        SequenceBatch dummy_barcode(n_reads, full_range);
 
                         // Generate best mappings for Hi-C pairs
                         if (pair_idx == 0) std::cerr << "[C++ Wrapper] Generating best Hi-C pairs mappings..." << std::endl;
-                        mapper->mapping_generator->GenerateBestMappingsForPairedEndRead(
+                        mapping_generator.GenerateBestMappingsForPairedEndRead(
                             pair_idx, read_batch1, read_batch2, dummy_barcode,
                             *(mapper->reference), best_mapping_indices, generator,
                             -1,  // force_mapq

@@ -117,6 +117,17 @@ impl ChromapAligner {
         ref_path: P2,
         num_threads: usize,
     ) -> Result<Self, ChromapError> {
+        Self::new_with_options(index_path, ref_path, num_threads, None, None)
+    }
+
+    /// Create a new ChromapAligner with optional mapping parameters.
+    pub fn new_with_options<P1: AsRef<Path>, P2: AsRef<Path>>(
+        index_path: P1,
+        ref_path: P2,
+        num_threads: usize,
+        min_num_seeds: Option<u32>,
+        min_read_length: Option<u32>,
+    ) -> Result<Self, ChromapError> {
         let index_path_str = index_path
             .as_ref()
             .to_str()
@@ -129,11 +140,16 @@ impl ChromapAligner {
         let c_index_path = CString::new(index_path_str)?;
         let c_ref_path = CString::new(ref_path_str)?;
 
+        let min_num_seeds_c = min_num_seeds.map(|v| v as i32).unwrap_or(-1);
+        let min_read_length_c = min_read_length.map(|v| v as i32).unwrap_or(-1);
+
         unsafe {
             let inner = chromap_sys::mapper_new(
                 c_index_path.as_ptr(),
                 c_ref_path.as_ptr(),
                 num_threads as i32,
+                min_num_seeds_c,
+                min_read_length_c,
             );
 
             if inner.is_null() {

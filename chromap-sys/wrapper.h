@@ -29,7 +29,10 @@ struct RustPairsMapping {
 // index_path: path to the chromap index file
 // ref_path: path to the reference FASTA file
 // num_threads: number of threads to use for mapping
-ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_threads);
+// min_num_seeds: minimum number of seeds for mapping (-s, use -1 for default: 2)
+// min_read_length: minimum read length (--min-read-length, use -1 for default: 30)
+ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_threads,
+                          int min_num_seeds, int min_read_length);
 
 // Free the ChromapMapper instance
 void mapper_free(ChromapMapper* mapper);
