@@ -43,6 +43,21 @@ pub struct RustPairsMapping {
     pub num_dups: u8,
 }
 
+/// Split alignment result structure for single-end reads with multiple alignments.
+/// Used for stitched Hi-C reads that may map to multiple locations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RustSplitAlignment {
+    pub read_id: u32,
+    pub rid: i32,
+    pub ref_pos: u32,
+    pub strand: i32,
+    pub query_start: u32,
+    pub query_end: u32,
+    pub mapq: u8,
+    pub is_primary: u8,
+}
+
 extern "C" {
     /// Create a new ChromapMapper instance
     ///
@@ -124,6 +139,27 @@ extern "C" {
     /// # Returns
     /// Length of the reference sequence or -1 on error
     pub fn mapper_get_reference_length(mapper: *mut ChromapMapper, index: c_int) -> c_int;
+
+    /// Map a batch of single-end reads with split alignment support
+    ///
+    /// # Arguments
+    /// * `mapper` - Pointer to ChromapMapper instance
+    /// * `seqs` - Array of pointers to DNA strings
+    /// * `quals` - Array of pointers to quality strings
+    /// * `n_reads` - Number of reads
+    /// * `out_buffer` - Output buffer for split alignments
+    /// * `buffer_size` - Size of output buffer (should be n_reads * max_splits_per_read)
+    ///
+    /// # Returns
+    /// Number of split alignments written or -1 on error
+    pub fn mapper_map_split_batch(
+        mapper: *mut ChromapMapper,
+        seqs: *const *const c_char,
+        quals: *const *const c_char,
+        n_reads: c_int,
+        out_buffer: *mut RustSplitAlignment,
+        buffer_size: c_int,
+    ) -> c_int;
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use chromap_sys::{ChromapMapper, RustPairsMapping};
+use chromap_sys::{ChromapMapper, RustPairsMapping, RustSplitAlignment};
 use std::ffi::{CStr, CString, NulError};
 use std::path::Path;
 use noodles::sam;
@@ -54,6 +54,19 @@ pub struct MappingResult {
     pub num_dups: u8,
 }
 
+/// A split alignment result for single-end reads with multiple alignments
+#[derive(Debug, Clone)]
+pub struct SplitAlignmentResult {
+    pub read_id: u32,
+    pub rid: i32,       // Reference ID (-1 = unmapped)
+    pub ref_pos: u32,   // Reference position
+    pub strand: Strand, // Strand
+    pub query_start: u32, // Start position in the read
+    pub query_end: u32,   // End position in the read
+    pub mapq: u8,
+    pub is_primary: bool,
+}
+
 /// Strand orientation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strand {
@@ -82,6 +95,25 @@ impl From<RustPairsMapping> for MappingResult {
             mapq: mapping.mapq,
             is_unique: mapping.is_unique != 0,
             num_dups: mapping.num_dups,
+        }
+    }
+}
+
+impl From<RustSplitAlignment> for SplitAlignmentResult {
+    fn from(alignment: RustSplitAlignment) -> Self {
+        SplitAlignmentResult {
+            read_id: alignment.read_id,
+            rid: alignment.rid,
+            ref_pos: alignment.ref_pos,
+            strand: if alignment.strand == 0 {
+                Strand::Forward
+            } else {
+                Strand::Reverse
+            },
+            query_start: alignment.query_start,
+            query_end: alignment.query_end,
+            mapq: alignment.mapq,
+            is_primary: alignment.is_primary != 0,
         }
     }
 }
@@ -330,6 +362,103 @@ impl ChromapAligner {
                 .into_iter()
                 .map(MappingResult::from)
                 .collect::<Vec<MappingResult>>())
+        }
+    }
+
+    /// Map a batch of single-end reads with split alignment support
+    ///
+    /// # Arguments
+    /// * `seqs` - DNA sequences (DNA strings)
+    /// * `quals` - Quality strings
+    ///
+    /// # Returns
+    /// Vector of split alignment results (may contain multiple alignments per read)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use chromap_rust::ChromapAligner;
+    /// # let aligner = ChromapAligner::new("ref.index", "ref.fa", 4).unwrap();
+    /// let seqs = vec!["ACGTACGTACGTACGT", "TGCATGCATGCATGCA"];
+    /// let quals = vec!["IIIIIIIIIIIIIIII", "IIIIIIIIIIIIIIII"];
+    ///
+    /// let results = aligner.map_split_batch(&seqs, &quals)
+    ///     .expect("Mapping failed");
+    /// ```
+    pub fn map_split_batch(
+        &self,
+        seqs: &[&str],
+        quals: &[&str],
+    ) -> Result<Vec<SplitAlignmentResult>, ChromapError> {
+        if seqs.len() != quals.len() {
+            return Err(ChromapError::InvalidInput(
+                "Sequences and qualities must have the same length".to_string(),
+            ));
+        }
+
+        let n = seqs.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Convert Rust strings to C strings
+        let c_seqs: Vec<CString> = seqs
+            .iter()
+            .map(|s| CString::new(*s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let c_quals: Vec<CString> = quals
+            .iter()
+            .map(|s| CString::new(*s))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Create pointer arrays
+        let ptrs_seqs: Vec<*const i8> = c_seqs.iter().map(|c| c.as_ptr()).collect();
+        let ptrs_quals: Vec<*const i8> = c_quals.iter().map(|c| c.as_ptr()).collect();
+
+        // Allocate output buffer for split alignments
+        // A single read might produce multiple alignments, so allocate more space
+        // Typical Hi-C stitched reads produce 2-3 alignments, so use 4x as buffer
+        let buffer_size = n * 4;
+        let mut results = vec![
+            RustSplitAlignment {
+                read_id: 0,
+                rid: -1,
+                ref_pos: 0,
+                strand: 0,
+                query_start: 0,
+                query_end: 0,
+                mapq: 0,
+                is_primary: 0,
+            };
+            buffer_size
+        ];
+
+        unsafe {
+            eprintln!("[ChromapAligner] Calling mapper_map_split_batch with {} reads", n);
+
+            let ret = chromap_sys::mapper_map_split_batch(
+                self.inner,
+                ptrs_seqs.as_ptr(),
+                ptrs_quals.as_ptr(),
+                n as i32,
+                results.as_mut_ptr(),
+                buffer_size as i32,
+            );
+
+            eprintln!("[ChromapAligner] mapper_map_split_batch returned: {} alignments", ret);
+
+            if ret < 0 {
+                eprintln!("[ChromapAligner] ERROR: mapper_map_split_batch failed with code {}", ret);
+                return Err(ChromapError::MappingError);
+            }
+
+            // Truncate to actual number of alignments
+            results.truncate(ret as usize);
+
+            // Convert to high-level results
+            Ok(results
+                .into_iter()
+                .map(SplitAlignmentResult::from)
+                .collect::<Vec<SplitAlignmentResult>>())
         }
     }
 

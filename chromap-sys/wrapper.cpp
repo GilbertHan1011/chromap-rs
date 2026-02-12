@@ -7,6 +7,7 @@
 #include "ext/chromap/src/mapping_generator.h"
 #include "ext/chromap/src/mapping_parameters.h"
 #include "ext/chromap/src/pairs_mapping.h"
+#include "ext/chromap/src/sam_mapping.h"
 #include "ext/chromap/src/draft_mapping_generator.h"
 #include "ext/chromap/src/paired_end_mapping_metadata.h"
 #include "ext/chromap/src/mapping_metadata.h"
@@ -476,6 +477,151 @@ int mapper_get_reference_length(ChromapMapper* mapper, int index) {
         return -1;
     }
     return mapper->reference->GetSequenceLengthAt(index);
+}
+
+// Map a batch of single-end reads with split alignment support
+int mapper_map_split_batch(ChromapMapper* mapper,
+                           const char** seqs, const char** quals,
+                           int n_reads,
+                           RustSplitAlignment* out_buffer,
+                           int buffer_size) {
+    if (!mapper || !seqs || !quals || n_reads <= 0 || !out_buffer || buffer_size <= 0) {
+        std::cerr << "[mapper_map_split_batch] Invalid input parameters" << std::endl;
+        return -1;
+    }
+
+    std::cerr << "[mapper_map_split_batch] Starting with " << n_reads << " reads" << std::endl;
+
+    try {
+        // Create SequenceBatch for single-end reads
+        SequenceEffectiveRange full_range;
+        SequenceBatch read_batch(n_reads, full_range);
+
+        auto& batch_seqs = read_batch.GetSequenceBatch();
+
+        // Populate the sequence batch
+        for (int i = 0; i < n_reads; ++i) {
+            char read_name[32];
+            snprintf(read_name, sizeof(read_name), "read_%d", i);
+            populate_kseq(batch_seqs[i], i, read_name, seqs[i], quals[i]);
+        }
+
+        // Prepare negative sequences (reverse complement)
+        for (int i = 0; i < n_reads; ++i) {
+            read_batch.PrepareNegativeSequenceAt(i);
+        }
+
+        // Instantiate per-batch processors on the stack (thread-safe)
+        MinimizerGenerator minimizer_generator(mapper->kmer_size, mapper->window_size);
+        CandidateProcessor candidate_processor(
+            mapper->params.min_num_seeds_required_for_mapping,
+            mapper->params.max_seed_frequencies);
+
+        // Create local params with split alignment enabled
+        MappingParameters local_params = mapper->params;
+        local_params.split_alignment = true;
+
+        DraftMappingGenerator draft_mapping_generator(local_params);
+
+        // For single-end mapping, we use natural chromosome ordering
+        std::vector<int> chr_ranks(mapper->num_reference_sequences);
+        for (uint32_t i = 0; i < mapper->num_reference_sequences; ++i) {
+            chr_ranks[i] = static_cast<int>(i);
+        }
+        MappingGenerator<SAMMapping> mapping_generator(local_params, chr_ranks);
+
+        std::mt19937 generator(11);
+        int total_mappings_written = 0;
+
+        // Process each read
+        for (int read_idx = 0; read_idx < n_reads; ++read_idx) {
+            if (read_idx % 5000 == 0) {
+                std::cerr << "[mapper_map_split_batch] Processing read " << read_idx << "/" << n_reads << std::endl;
+            }
+
+            // Skip if read is too short
+            if (read_batch.GetSequenceLengthAt(read_idx) < mapper->params.min_read_length) {
+                continue;
+            }
+
+            // Create metadata for this read
+            MappingMetadata metadata;
+            metadata.ReserveSpace(2000);
+
+            // Generate minimizers
+            minimizer_generator.GenerateMinimizers(read_batch, read_idx, metadata.minimizers_);
+            if (metadata.minimizers_.empty()) {
+                continue;
+            }
+
+            // Generate candidates
+            candidate_processor.GenerateCandidates(
+                local_params.error_threshold,
+                *(mapper->index),
+                metadata);
+
+            // Generate draft mappings if we have candidates
+            if (metadata.GetNumCandidates() > 0) {
+                draft_mapping_generator.GenerateDraftMappings(
+                    read_batch, read_idx, *(mapper->reference), metadata);
+            }
+
+            // Generate final mappings (with split alignment support)
+            if (metadata.GetNumDraftMappings() > 0) {
+                std::vector<std::vector<SAMMapping>> mappings_on_refs(mapper->num_reference_sequences);
+
+                // Dummy barcode batch (not used for bulk data)
+                SequenceBatch dummy_barcode(n_reads, full_range);
+
+                // This function automatically handles split alignment logic
+                mapping_generator.GenerateBestMappingsForSingleEndRead(
+                    read_batch, read_idx, *(mapper->reference), dummy_barcode,
+                    metadata, mappings_on_refs);
+
+                // Write mappings to output buffer
+                // A single read might produce 0, 1, or multiple SAMMapping objects across refs
+                for (const auto& ref_mappings : mappings_on_refs) {
+                    for (const auto& m : ref_mappings) {
+                        if (total_mappings_written >= buffer_size) {
+                            std::cerr << "[mapper_map_split_batch] Warning: Output buffer full at "
+                                      << total_mappings_written << " mappings" << std::endl;
+                            break;
+                        }
+
+                        RustSplitAlignment& out = out_buffer[total_mappings_written];
+                        out.read_id = read_idx;
+                        out.rid = m.rid_;
+                        out.ref_pos = static_cast<uint32_t>(m.pos_);
+                        out.strand = m.is_rev_ ? 1 : 0;
+
+                        // Calculate query start and end from CIGAR
+                        // For split alignments, we need to track which part of the read this is
+                        // For now, use 0 as start and sequence length as end (simplified)
+                        out.query_start = 0;
+                        out.query_end = read_batch.GetSequenceLengthAt(read_idx);
+
+                        out.mapq = static_cast<uint8_t>(m.mapq_);
+                        // Check if this is a primary alignment (not supplementary)
+                        out.is_primary = (m.flag_ & BAM_FSUPPLEMENTARY) ? 0 : 1;
+
+                        total_mappings_written++;
+                    }
+                    if (total_mappings_written >= buffer_size) break;
+                }
+            }
+        }
+
+        std::cerr << "[mapper_map_split_batch] Completed: " << total_mappings_written
+                  << " alignments from " << n_reads << " reads" << std::endl;
+        return total_mappings_written;
+
+    } catch (const std::exception& e) {
+        std::cerr << "[mapper_map_split_batch] ERROR: Exception caught: " << e.what() << std::endl;
+        return -1;
+    } catch (...) {
+        std::cerr << "[mapper_map_split_batch] ERROR: Unknown exception caught" << std::endl;
+        return -1;
+    }
 }
 
 } // extern "C"

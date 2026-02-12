@@ -63,6 +63,33 @@ const char* mapper_get_reference_name(ChromapMapper* mapper, int index);
 // Get the length of a reference sequence by index
 int mapper_get_reference_length(ChromapMapper* mapper, int index);
 
+// Output struct for split alignment results (single-end reads with multiple alignments)
+struct RustSplitAlignment {
+    uint32_t read_id;       // Which read this belongs to
+    int32_t rid;            // Reference ID (-1 = unmapped)
+    uint32_t ref_pos;       // Reference start position
+    int32_t strand;         // 0: +, 1: -
+    uint32_t query_start;   // Where in the read this alignment starts
+    uint32_t query_end;     // Where in the read this alignment ends
+    uint8_t mapq;
+    uint8_t is_primary;     // Is this the "best" alignment?
+};
+
+// Map a batch of single-end reads with split alignment support
+// mapper: the ChromapMapper instance
+// seqs: array of pointers to DNA strings (null-terminated)
+// quals: array of pointers to quality strings (null-terminated)
+// n_reads: number of reads in the batch
+// out_buffer: pointer to output buffer (allocated by caller)
+// buffer_size: size of the output buffer (should be n_reads * max_splits_per_read)
+// Returns: number of split alignments written to out_buffer (may be > n_reads)
+int mapper_map_split_batch(ChromapMapper* mapper,
+                           const char** seqs,
+                           const char** quals,
+                           int n_reads,
+                           RustSplitAlignment* out_buffer,
+                           int buffer_size);
+
 #ifdef __cplusplus
 }
 #endif
