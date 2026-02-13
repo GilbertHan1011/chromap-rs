@@ -72,12 +72,14 @@ extern "C" {
     /// # Optional parameters (use -1 for default)
     /// * `min_num_seeds` - minimum number of seeds for mapping (-s), default 2
     /// * `min_read_length` - minimum read length (--min-read-length), default 30
+    /// * `max_num_best_mappings` - maximum number of best alignments to report per read, default 1
     pub fn mapper_new(
         index_path: *const c_char,
         ref_path: *const c_char,
         num_threads: c_int,
         min_num_seeds: c_int,
         min_read_length: c_int,
+        max_num_best_mappings: c_int,
     ) -> *mut ChromapMapper;
 
     /// Free a ChromapMapper instance

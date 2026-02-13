@@ -16,8 +16,46 @@
 #include <memory>
 #include <random>
 #include <algorithm>
+#include <map>
+#include <thread>
+#include <mutex>
 
 using namespace chromap;
+
+// Helper function to calculate query start and end positions from CIGAR
+// For split alignments, this tells us which part of the read this alignment covers
+static void calculate_query_positions(const SAMMapping& m, uint32_t& query_start, uint32_t& query_end) {
+    query_start = 0;
+    query_end = 0;
+
+    if (m.n_cigar_ == 0 || m.cigar_.empty()) {
+        return;
+    }
+
+    uint32_t query_pos = 0;
+
+    // Process CIGAR to find query start (skip leading soft/hard clips)
+    for (int ci = 0; ci < m.n_cigar_; ++ci) {
+        uint32_t op = bam_cigar_op(m.cigar_[ci]);
+        uint32_t op_length = bam_cigar_oplen(m.cigar_[ci]);
+
+        // Soft clip at the beginning defines query_start
+        if (ci == 0 && op == BAM_CSOFT_CLIP) {
+            query_start = op_length;
+            query_pos = op_length;
+        }
+        // Hard clip doesn't consume query
+        else if (op == BAM_CHARD_CLIP) {
+            continue;
+        }
+        // Query-consuming operations (M, I, S, =, X)
+        else if ((bam_cigar_type(op) & 0x1) > 0) {
+            query_pos += op_length;
+        }
+    }
+
+    query_end = query_pos;
+}
 
 // Helper function to populate a kseq_t structure from C strings
 static void populate_kseq(SequenceBatch::kseq_t* seq, uint32_t id, const char* name,
@@ -90,7 +128,7 @@ struct ChromapMapper {
 extern "C" {
 
 ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_threads,
-                          int min_num_seeds, int min_read_length) {
+                          int min_num_seeds, int min_read_length, int max_num_best_mappings) {
     ChromapMapper* mapper = new ChromapMapper();
 
     try {
@@ -106,14 +144,14 @@ ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_
         mapper->params.split_alignment = true;            // Allow chimeric alignments at ligation junctions
         mapper->params.low_memory_mode = true;           // Hi-C preset uses low memory mode
         mapper->params.mapping_output_format = MAPPINGFORMAT_PAIRS;  // Hi-C pairs format
-        
+
         // Adjustable seed and read-length settings (-s and --min-read-length)
         mapper->params.min_num_seeds_required_for_mapping = (min_num_seeds >= 0) ? min_num_seeds : 2;
         mapper->params.min_read_length = (min_read_length >= 0) ? min_read_length : 30;
         mapper->params.max_seed_frequencies.resize(2);
         mapper->params.max_seed_frequencies[0] = 500;
         mapper->params.max_seed_frequencies[1] = 1000;
-        mapper->params.max_num_best_mappings = 1;
+        mapper->params.max_num_best_mappings = (max_num_best_mappings >= 0) ? max_num_best_mappings : 1;
         mapper->params.max_insert_size = 1000;           // Not strictly enforced in Hi-C mode
         mapper->params.is_bulk_data = true;
         
@@ -139,6 +177,10 @@ ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_
         mapper->kmer_size = mapper->index->GetKmerSize();
         mapper->window_size = mapper->index->GetWindowSize();
         std::cerr << "[mapper_new] Reference and index loaded successfully" << std::endl;
+        std::cerr << "[mapper_new] Parameters:" << std::endl;
+        std::cerr << "[mapper_new]   min_num_seeds: " << mapper->params.min_num_seeds_required_for_mapping << std::endl;
+        std::cerr << "[mapper_new]   min_read_length: " << mapper->params.min_read_length << std::endl;
+        std::cerr << "[mapper_new]   max_num_best_mappings: " << mapper->params.max_num_best_mappings << std::endl;
 
         std::cerr << "[mapper_new] Mapper initialization completed successfully" << std::endl;
         return mapper;
@@ -503,116 +545,208 @@ int mapper_map_split_batch(ChromapMapper* mapper,
         for (int i = 0; i < n_reads; ++i) {
             char read_name[32];
             snprintf(read_name, sizeof(read_name), "read_%d", i);
-            populate_kseq(batch_seqs[i], i, read_name, seqs[i], quals[i]);
+
+            // Check for null or empty sequences
+            const char* seq_ptr = seqs[i];
+            const char* qual_ptr = quals[i];
+
+            if (!seq_ptr || strlen(seq_ptr) == 0) {
+                std::cerr << "[mapper_map_split_batch] Warning: Empty sequence at read " << i << ", skipping" << std::endl;
+                continue;
+            }
+            if (!qual_ptr) {
+                qual_ptr = ""; // Use empty quality if null
+            }
+
+            populate_kseq(batch_seqs[i], i, read_name, seq_ptr, qual_ptr);
         }
 
         // Prepare negative sequences (reverse complement)
         for (int i = 0; i < n_reads; ++i) {
-            read_batch.PrepareNegativeSequenceAt(i);
+            if (read_batch.GetSequenceLengthAt(i) > 0) {
+                read_batch.PrepareNegativeSequenceAt(i);
+            }
         }
 
-        // Instantiate per-batch processors on the stack (thread-safe)
-        MinimizerGenerator minimizer_generator(mapper->kmer_size, mapper->window_size);
-        CandidateProcessor candidate_processor(
-            mapper->params.min_num_seeds_required_for_mapping,
-            mapper->params.max_seed_frequencies);
-
-        // Create local params with split alignment enabled
+        // Create local params with split alignment enabled and SAM output format.
+        // SAM format is required because MappingGenerator<SAMMapping> needs
+        // qual_sequence and SAM_flag to be initialised in
+        // ProcessBestMappingsForSingleEndRead (guarded by MAPPINGFORMAT_SAM).
+        // Without this, qual_sequence stays nullptr and the SAMMapping
+        // constructor crashes with "basic_string: construction from null".
         MappingParameters local_params = mapper->params;
         local_params.split_alignment = true;
-
-        DraftMappingGenerator draft_mapping_generator(local_params);
+        local_params.mapping_output_format = MAPPINGFORMAT_SAM;
 
         // For single-end mapping, we use natural chromosome ordering
         std::vector<int> chr_ranks(mapper->num_reference_sequences);
         for (uint32_t i = 0; i < mapper->num_reference_sequences; ++i) {
             chr_ranks[i] = static_cast<int>(i);
         }
-        MappingGenerator<SAMMapping> mapping_generator(local_params, chr_ranks);
 
-        std::mt19937 generator(11);
-        int total_mappings_written = 0;
+        // We parallelize over reads using std::thread. Each thread has its own
+        // per-read mapping state and accumulates results in a local buffer,
+        // which we merge at the end into the caller-provided out_buffer.
+        int num_threads = mapper->num_threads > 0 ? mapper->num_threads : 1;
+        if (num_threads > n_reads) {
+            num_threads = n_reads;
+        }
 
-        // Process each read
-        for (int read_idx = 0; read_idx < n_reads; ++read_idx) {
-            if (read_idx % 5000 == 0) {
-                std::cerr << "[mapper_map_split_batch] Processing read " << read_idx << "/" << n_reads << std::endl;
-            }
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
 
-            // Skip if read is too short
-            if (read_batch.GetSequenceLengthAt(read_idx) < mapper->params.min_read_length) {
-                continue;
-            }
+        // Shared result buffer guarded by a mutex.
+        std::vector<RustSplitAlignment> all_results;
+        all_results.reserve(buffer_size);
+        std::mutex results_mutex;
 
-            // Create metadata for this read
-            MappingMetadata metadata;
-            metadata.ReserveSpace(2000);
+        // Capture any exception from worker threads.
+        std::exception_ptr thread_exception = nullptr;
+        std::mutex exception_mutex;
 
-            // Generate minimizers
-            minimizer_generator.GenerateMinimizers(read_batch, read_idx, metadata.minimizers_);
-            if (metadata.minimizers_.empty()) {
-                continue;
-            }
+        auto worker_fn = [&](int thread_id, int start_idx, int end_idx) {
+            try {
+                // Thread-local processors and generators.
+                MinimizerGenerator minimizer_generator(mapper->kmer_size, mapper->window_size);
+                CandidateProcessor candidate_processor(
+                    local_params.min_num_seeds_required_for_mapping,
+                    local_params.max_seed_frequencies);
+                DraftMappingGenerator draft_mapping_generator(local_params);
+                MappingGenerator<SAMMapping> mapping_generator(local_params, chr_ranks);
 
-            // Generate candidates
-            candidate_processor.GenerateCandidates(
-                local_params.error_threshold,
-                *(mapper->index),
-                metadata);
+                std::vector<RustSplitAlignment> local_results;
+                local_results.reserve((end_idx - start_idx) * 2);
 
-            // Generate draft mappings if we have candidates
-            if (metadata.GetNumCandidates() > 0) {
-                draft_mapping_generator.GenerateDraftMappings(
-                    read_batch, read_idx, *(mapper->reference), metadata);
-            }
+                for (int read_idx = start_idx; read_idx < end_idx; ++read_idx) {
+                    if (thread_id == 0 && read_idx % 5000 == 0) {
+                        std::cerr << "[mapper_map_split_batch] Processing read " << read_idx
+                                  << "/" << n_reads << std::endl;
+                    }
 
-            // Generate final mappings (with split alignment support)
-            if (metadata.GetNumDraftMappings() > 0) {
-                std::vector<std::vector<SAMMapping>> mappings_on_refs(mapper->num_reference_sequences);
+                    // Skip if read is too short.
+                    if (read_batch.GetSequenceLengthAt(read_idx) < local_params.min_read_length) {
+                        continue;
+                    }
 
-                // Dummy barcode batch (not used for bulk data)
-                SequenceBatch dummy_barcode(n_reads, full_range);
+                    // Per-read mapping metadata.
+                    MappingMetadata metadata;
+                    metadata.ReserveSpace(2000);
 
-                // This function automatically handles split alignment logic
-                mapping_generator.GenerateBestMappingsForSingleEndRead(
-                    read_batch, read_idx, *(mapper->reference), dummy_barcode,
-                    metadata, mappings_on_refs);
+                    // Generate minimizers.
+                    minimizer_generator.GenerateMinimizers(read_batch, read_idx, metadata.minimizers_);
+                    if (metadata.minimizers_.empty()) {
+                        continue;
+                    }
 
-                // Write mappings to output buffer
-                // A single read might produce 0, 1, or multiple SAMMapping objects across refs
-                for (const auto& ref_mappings : mappings_on_refs) {
-                    for (const auto& m : ref_mappings) {
-                        if (total_mappings_written >= buffer_size) {
-                            std::cerr << "[mapper_map_split_batch] Warning: Output buffer full at "
-                                      << total_mappings_written << " mappings" << std::endl;
+                    // Generate candidates.
+                    candidate_processor.GenerateCandidates(
+                        local_params.error_threshold,
+                        *(mapper->index),
+                        metadata);
+
+                    // Generate draft mappings if we have candidates.
+                    if (metadata.GetNumCandidates() > 0) {
+                        draft_mapping_generator.GenerateDraftMappings(
+                            read_batch, read_idx, *(mapper->reference), metadata);
+                    } else {
+                        continue;
+                    }
+
+                    if (metadata.GetNumDraftMappings() == 0) {
+                        continue;
+                    }
+
+                    // Generate final mappings (with split alignment support).
+                    std::vector<std::vector<SAMMapping>> mappings_on_refs(mapper->num_reference_sequences);
+
+                    // Dummy barcode batch (not used for bulk data).
+                    SequenceBatch dummy_barcode(n_reads, full_range);
+
+                    mapping_generator.GenerateBestMappingsForSingleEndRead(
+                        read_batch, read_idx, *(mapper->reference), dummy_barcode,
+                        metadata, mappings_on_refs);
+
+                    // Convert SAMMapping records into RustSplitAlignment records.
+                    for (const auto& ref_mappings : mappings_on_refs) {
+                        for (const auto& m : ref_mappings) {
+                            RustSplitAlignment out{};
+                            out.read_id = read_idx;
+                            out.rid = m.rid_;
+                            out.ref_pos = static_cast<uint32_t>(m.pos_);
+                            out.strand = m.is_rev_ ? 1 : 0;
+
+                            // Calculate query start and end from CIGAR. This is
+                            // critical for split alignments to identify 5' and 3' ends.
+                            calculate_query_positions(m, out.query_start, out.query_end);
+
+                            out.mapq = static_cast<uint8_t>(m.mapq_);
+                            out.is_primary = (m.flag_ & BAM_FSUPPLEMENTARY) ? 0 : 1;
+
+                            local_results.push_back(out);
+
+                            if (static_cast<int>(local_results.size()) >= buffer_size) {
+                                // Local buffer full; we will be truncated on merge anyway.
+                                break;
+                            }
+                        }
+                        if (static_cast<int>(local_results.size()) >= buffer_size) {
                             break;
                         }
-
-                        RustSplitAlignment& out = out_buffer[total_mappings_written];
-                        out.read_id = read_idx;
-                        out.rid = m.rid_;
-                        out.ref_pos = static_cast<uint32_t>(m.pos_);
-                        out.strand = m.is_rev_ ? 1 : 0;
-
-                        // Calculate query start and end from CIGAR
-                        // For split alignments, we need to track which part of the read this is
-                        // For now, use 0 as start and sequence length as end (simplified)
-                        out.query_start = 0;
-                        out.query_end = read_batch.GetSequenceLengthAt(read_idx);
-
-                        out.mapq = static_cast<uint8_t>(m.mapq_);
-                        // Check if this is a primary alignment (not supplementary)
-                        out.is_primary = (m.flag_ & BAM_FSUPPLEMENTARY) ? 0 : 1;
-
-                        total_mappings_written++;
                     }
-                    if (total_mappings_written >= buffer_size) break;
                 }
+
+                // Merge this thread's results into the global buffer, up to buffer_size.
+                {
+                    std::lock_guard<std::mutex> lock(results_mutex);
+                    if (!local_results.empty() && static_cast<int>(all_results.size()) < buffer_size) {
+                        size_t space_left = static_cast<size_t>(buffer_size) - all_results.size();
+                        size_t to_copy = std::min(space_left, local_results.size());
+                        all_results.insert(all_results.end(),
+                                           local_results.begin(),
+                                           local_results.begin() + to_copy);
+                    }
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(exception_mutex);
+                if (!thread_exception) {
+                    thread_exception = std::current_exception();
+                }
+            }
+        };
+
+        // Launch worker threads over contiguous ranges of reads.
+        int reads_per_thread = (n_reads + num_threads - 1) / num_threads;
+        for (int t = 0; t < num_threads; ++t) {
+            int start_idx = t * reads_per_thread;
+            int end_idx = std::min(start_idx + reads_per_thread, n_reads);
+            if (start_idx >= end_idx) {
+                break;
+            }
+            workers.emplace_back(worker_fn, t, start_idx, end_idx);
+        }
+
+        for (auto& th : workers) {
+            if (th.joinable()) {
+                th.join();
             }
         }
 
+        if (thread_exception) {
+            // Re-throw the first exception captured from any worker.
+            std::rethrow_exception(thread_exception);
+        }
+
+        int total_mappings_written = static_cast<int>(all_results.size());
+
+        // Copy merged results into the caller-provided buffer.
+        for (int i = 0; i < total_mappings_written; ++i) {
+            out_buffer[i] = all_results[i];
+        }
+
         std::cerr << "[mapper_map_split_batch] Completed: " << total_mappings_written
-                  << " alignments from " << n_reads << " reads" << std::endl;
+                  << " alignments from " << n_reads << " reads using "
+                  << num_threads << " thread(s)" << std::endl;
+
         return total_mappings_written;
 
     } catch (const std::exception& e) {

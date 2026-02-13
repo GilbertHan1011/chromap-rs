@@ -31,8 +31,9 @@ struct RustPairsMapping {
 // num_threads: number of threads to use for mapping
 // min_num_seeds: minimum number of seeds for mapping (-s, use -1 for default: 2)
 // min_read_length: minimum read length (--min-read-length, use -1 for default: 30)
+// max_num_best_mappings: maximum number of best alignments to report per read (use -1 for default: 1)
 ChromapMapper* mapper_new(const char* index_path, const char* ref_path, int num_threads,
-                          int min_num_seeds, int min_read_length);
+                          int min_num_seeds, int min_read_length, int max_num_best_mappings);
 
 // Free the ChromapMapper instance
 void mapper_free(ChromapMapper* mapper);
